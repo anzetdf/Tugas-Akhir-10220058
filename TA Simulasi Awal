@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <title>Simulasi Futsal 1v1 - Data Sampling</title>
+    <style>
+        :root {
+            --bg-dark: #121212;
+            --bg-panel: #1e1e1e;
+            --text-light: #e0e0e0;
+            --text-muted: #a0a0a0;
+            --accent-blue: #007bff;
+            --accent-green: #00c853;
+            --accent-yellow: #ffd600;
+            --accent-red: #d50000;
+        }
+        body { 
+            background-color: var(--bg-dark); 
+            color: var(--text-light); 
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            min-height: 100vh;
+            gap: 20px;
+        }
+        
+        /* Layout Grid */
+        .container {
+            display: flex;
+            gap: 25px;
+            background-color: var(--bg-panel);
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            align-items: flex-start;
+        }
+
+        .sidebar { width: 280px; display: flex; flex-direction: column; gap: 20px; }
+        .canvas-area { border-radius: 12px; overflow: hidden; border: 2px solid #333; }
+        
+        /* Buttons & Panels */
+        button {
+            padding: 12px; font-size: 16px; font-weight: bold;
+            border: none; border-radius: 8px; cursor: pointer;
+            transition: background 0.2s; color: white; margin-bottom: 5px;
+        }
+        #shootBtn { background-color: var(--accent-blue); }
+        #shootBtn:hover { background-color: #0056b3; }
+        #scanBtn { background-color: #6200ea; } /* Warna Ungu untuk Data */
+        #scanBtn:hover { background-color: #3700b3; }
+
+        .panel { background: #2a2a2a; padding: 15px; border-radius: 8px; }
+        .panel-label { font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 5px; }
+        .panel-value { font-size: 18px; font-weight: bold; }
+        
+        /* xG Visuals */
+        .xg-main-value { font-size: 32px; font-weight: 800; color: var(--accent-green); display: block; text-align: center; }
+        .xg-bar-container { height: 10px; background: #444; border-radius: 5px; overflow: hidden; margin-top: 10px; }
+        #xgBar { height: 100%; width: 0%; background: var(--accent-green); transition: width 0.3s; }
+
+        /* DATA TABLE (New Feature) */
+        .data-results {
+            margin-top: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+            background: #111;
+            padding: 10px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 12px;
+            border: 1px solid #444;
+        }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 4px; border-bottom: 1px solid #333; }
+        th { color: var(--accent-yellow); }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="sidebar">
+        <h2 style="margin:0">Futsal Kinematics</h2>
+        <div style="font-size:12px; color:#888;">Draft TA 10220058</div>
+
+        <div style="display:flex; flex-direction:column; gap:10px;">
+            <button id="shootBtn" onclick="shoot()">TEMBAK (SHOOT)</button>
+            <button id="scanBtn" onclick="scanFieldData()">AMBIL DATA (SCAN 1M)</button>
+        </div>
+
+        <div class="panel">
+            <span class="panel-label">Realtime xG</span>
+            <span id="xgValue" class="xg-main-value">0.00</span>
+            <div class="xg-bar-container"><div id="xgBar"></div></div>
+        </div>
+
+        <div class="panel">
+            <span class="panel-label">Hasil Sampling Data (xG vs Posisi)</span>
+            <div class="data-results" id="dataOutput">
+                <em>Klik "Ambil Data" untuk generate tabel...</em>
+            </div>
+        </div>
+    </div>
+
+    <div class="canvas-area">
+        <canvas id="fieldCanvas" width="500" height="600"></canvas>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('fieldCanvas');
+    const ctx = canvas.getContext('2d');
+    const SCALE = 20; 
+    const ORIGIN_X = canvas.width / 2; 
+    const ORIGIN_Y = canvas.height - 50;
+
+    // --- AGEN ---
+    let gk = { x0: 0, A: 1.8, omega: (2*Math.PI)/3, phi: 0, y_pos: 1, limit_left: -1.5, limit_right: 1.5, radius_block: 0.40, x_curr: 0, diveTimer: 0 };
+    let st = { x0: 0, A: 7.0, omega: 0.2, phi: Math.PI/2, y_pos: 6, x_curr: 0, manual: false };
+    let ball = { active: false, x: 0, y: 0, vx: 0, vy: 0 };
+    let t = 0; let dt = 0.016; 
+    
+    // Variabel Global xG
+    let currentXG = 0;
+
+    function tx(meters) { return ORIGIN_X + (meters * SCALE); }
+    function ty(meters) { return ORIGIN_Y - (meters * SCALE); }
+
+    // --- FUNGSI UTAMA: CALCULATE xG ---
+    // Sekarang menerima parameter 'test_x' (opsional). 
+    // Jika kosong, pakai posisi striker asli.
+    function calculateXG(test_x = null) {
+        const strikerX = (test_x !== null) ? test_x : st.x_curr;
+        
+        const T_period = (2 * Math.PI) / gk.omega; 
+        const dt_sim = 0.02;
+        let total = 0, open = 0;
+
+        // Hitung titik potong bola di garis pertahanan (y=1)
+        // Rumus Geometri: x_intersep = x_striker * (y_kiper / y_striker)
+        let interceptX = strikerX * (gk.y_pos / st.y_pos);
+
+        // Time Sweep (Simulasi 1 Periode Kiper)
+        for(let ts=0; ts<=T_period; ts+=dt_sim){
+            total++;
+            // Posisi Kiper pada waktu ts
+            let rawGkX = gk.x0 + gk.A * Math.sin(gk.omega * ts + gk.phi);
+            let gkx = rawGkX; // Batas gerak dihapus agar lebih realistis
+            
+            // Cek Celah
+            if(Math.abs(interceptX - gkx) > gk.radius_block) {
+                open++;
+            }
+        }
+        return open / total;
+    }
+
+    // --- FUNGSI BARU: SCAN DATA 1 METER ---
+    function scanFieldData() {
+        let outputHTML = "<table><thead><tr><th>Pos (m)</th><th>xG</th><th>Status</th></tr></thead><tbody>";
+        console.log("--- MULAI PENGAMBILAN DATA (Per 1 Meter) ---");
+        console.log("Posisi_Striker_X, Nilai_xG");
+
+        // Loop dari -9 meter sampai 9 meter (Agar tetap di dalam lapangan)
+        // Step 1 meter
+        for (let x = -9; x <= 9; x += 1) {
+            let val = calculateXG(x); // Panggil fungsi hitung dengan posisi buatan
+            
+            // Format Data
+            let color = val > 0.7 ? "#00c853" : val > 0.4 ? "#ffd600" : "#d50000";
+            outputHTML += `<tr>
+                <td>${x.toFixed(1)}</td>
+                <td style="color:${color}; font-weight:bold;">${val.toFixed(2)}</td>
+                <td>${val > 0.7 ? "Mudah" : "Sulit"}</td>
+            </tr>`;
+            
+            console.log(`${x}, ${val.toFixed(4)}`);
+        }
+        
+        outputHTML += "</tbody></table>";
+        document.getElementById('dataOutput').innerHTML = outputHTML;
+        alert("Data berhasil diambil! Cek tabel di layar atau Console (F12) untuk copy-paste.");
+    }
+
+    // --- VISUALISASI ---
+    function drawField() {
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        // Lapangan
+        ctx.strokeStyle="white"; ctx.lineWidth=2; ctx.beginPath();
+        ctx.rect(tx(-10), ty(0), 20*SCALE, -20*SCALE); ctx.stroke();
+        ctx.beginPath(); ctx.arc(tx(0), ty(20), 3*SCALE, 0, Math.PI); ctx.stroke(); // Lingkaran Tengah
+        ctx.beginPath(); ctx.arc(tx(0), ty(0), 6*SCALE, Math.PI, 0); ctx.stroke(); // Area Penalti
+        
+        // Garis Lintasan Agen
+        ctx.strokeStyle="cyan"; 
+        ctx.beginPath(); ctx.moveTo(tx(gk.x0 - gk.A),ty(gk.y_pos)); ctx.lineTo(tx(gk.x0 + gk.A),ty(gk.y_pos)); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(tx(-9.5),ty(st.y_pos)); ctx.lineTo(tx(9.5),ty(st.y_pos)); ctx.stroke();
+
+        // Label
+        // Label batas dihapus karena kiper bergerak bebas
+        
+        // Gawang
+        ctx.strokeStyle="#fff"; ctx.strokeRect(tx(-1.5), ty(0), 3*SCALE, 10);
+    }
+
+    function drawLabel(text, x, y, align, color="red") {
+        ctx.fillStyle=color; ctx.beginPath(); ctx.arc(tx(x), ty(y), 4, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle="#fff"; ctx.font="10px Arial"; ctx.textAlign=align;
+        ctx.fillText(text, tx(x)+(align=="left"?8:-8), ty(y)-8);
+    }
+
+    function drawAgents() {
+        // Kiper
+        ctx.fillStyle = gk.diveTimer > 0 ? "#ff00ff" : "yellow"; ctx.beginPath(); ctx.arc(tx(gk.x_curr),ty(gk.y_pos),7,0,Math.PI*2); ctx.fill();
+        // Striker
+        ctx.fillStyle="#ff4444"; ctx.beginPath(); ctx.arc(tx(st.x_curr),ty(st.y_pos),7,0,Math.PI*2); ctx.fill();
+        // Bola
+        if(ball.active){ ctx.fillStyle="white"; ctx.beginPath(); ctx.arc(tx(ball.x),ty(ball.y),5,0,Math.PI*2); ctx.fill(); }
+    }
+
+    function update() {
+        if(gk.diveTimer > 0) gk.diveTimer--;
+
+        if(!ball.active) { 
+            t+=dt; 
+            currentXG = calculateXG(); // Hitung xG realtime untuk animasi
+            updateUI(); 
+        }
+        
+        if (!ball.active) {
+            // Mode Tracking: Kiper menutup sudut striker (Pre-Shot)
+            let idealGkX = st.x_curr * (gk.y_pos / st.y_pos);
+            gk.x_curr += (idealGkX - gk.x_curr) * 0.1;
+            
+            // Update posisi striker
+            if(!st.manual) st.x_curr = st.x0 + st.A*Math.sin(st.omega*t + st.phi);
+        } else {
+            // Mode Reaksi: Kiper memprediksi titik potong bola
+            // Hitung intercept X saat y = gk.y_pos agar tidak mengejar bayangan bola
+            let interceptX = ball.x + (gk.y_pos - ball.y) * (ball.vx / ball.vy);
+            gk.x_curr += (interceptX - gk.x_curr) * 0.08; 
+        }
+
+        // Fisika Bola
+        if(ball.active){
+            ball.x+=ball.vx*dt; ball.y+=ball.vy*dt;
+            // Cek Tabrakan
+            if(ball.y<=gk.y_pos && ball.y>=gk.y_pos-0.5 && Math.abs(ball.x-gk.x_curr)<=gk.radius_block){
+                ball.active=false; 
+                document.getElementById('shootBtn').disabled=false;
+                gk.diveTimer = 30; // Efek visual selama 30 frame (0.5 detik)
+            }
+            // Cek Gawang
+            if(ball.y<=0){ 
+                ball.active=false; 
+                document.getElementById('shootBtn').disabled=false;
+            }
+        }
+    }
+
+    function shoot() { 
+        if(ball.active)return; 
+        ball.x=st.x_curr; ball.y=st.y_pos; ball.active=true;
+        
+        // Target: Tiang Jauh (Lawan arah dari posisi striker)
+        // Jika striker di Kanan (>0), tembak ke Kiri (-1.3). Dan sebaliknya.
+        let targetX = (st.x_curr > 0) ? -1.3 : 1.3; 
+        let dx = targetX - ball.x;
+        let dy = 0 - ball.y;
+        let d=Math.sqrt(dx*dx+dy*dy), s=26; 
+        
+        ball.vx=(dx/d)*s; ball.vy=(dy/d)*s;
+        document.getElementById('shootBtn').disabled=true; 
+    }
+
+    // --- INTERAKSI MOUSE (DRAG & DROP) ---
+    let isDragging = false;
+
+    canvas.addEventListener('mousedown', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const mx = (e.clientX - rect.left - ORIGIN_X) / SCALE;
+        const my = (ORIGIN_Y - (e.clientY - rect.top)) / SCALE;
+        
+        // Cek apakah klik dekat striker (radius 1m)
+        if(Math.sqrt((mx - st.x_curr)**2 + (my - st.y_pos)**2) < 1.0) {
+            isDragging = true;
+            st.manual = true; // Matikan gerak otomatis selamanya setelah diklik
+            canvas.style.cursor = "grabbing";
+        }
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const mx = (e.clientX - rect.left - ORIGIN_X) / SCALE;
+        const my = (ORIGIN_Y - (e.clientY - rect.top)) / SCALE;
+
+        if(isDragging) {
+            st.x_curr = Math.max(-10, Math.min(10, mx)); // Batas lapangan X
+            st.y_pos = Math.max(1, Math.min(20, my));    // Batas lapangan Y
+        } else {
+            // Efek hover kursor
+            const dist = Math.sqrt((mx - st.x_curr)**2 + (my - st.y_pos)**2);
+            canvas.style.cursor = dist < 1.0 ? "grab" : "default";
+        }
+    });
+
+    canvas.addEventListener('mouseup', () => { isDragging = false; canvas.style.cursor = "grab"; });
+
+    function updateUI() {
+        const valEl = document.getElementById('xgValue');
+        const barEl = document.getElementById('xgBar');
+        valEl.innerText = currentXG.toFixed(2);
+        barEl.style.width = (currentXG * 100) + "%";
+        let color = currentXG >= 0.7 ? "var(--accent-green)" : currentXG >= 0.4 ? "var(--accent-yellow)" : "var(--accent-red)";
+        valEl.style.color = color; barEl.style.background = color;
+    }
+
+    function loop() { update(); drawField(); drawAgents(); requestAnimationFrame(loop); }
+    loop();
+</script>
+</body>
+</html>

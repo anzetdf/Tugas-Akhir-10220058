@@ -95,16 +95,16 @@
             <label class="panel-label">Tipe Striker (ST)</label>
             <select id="stSelect" onchange="updateConfig()" style="width:100%; margin-bottom:10px; padding:5px; background:#333; color:white; border:1px solid #555; border-radius:4px;">
                 <option value="1">ST 1: Tiang Dekat</option>
-                <option value="2" selected>ST 2: Tiang Jauh</option>
-                <option value="3">ST 3: Celah Terlebar</option>
+                <option value="2">ST 2: Tiang Jauh</option>
+                <option value="3" selected>ST 3: Celah Terlebar</option>
             </select>
             <button id="stToggleBtn" onclick="toggleStMove()" style="width:100%; padding:8px; margin-bottom:10px; font-size:12px; background:var(--accent-green); border:none; color:white;">Gerak ST: AUTO</button>
             
             <label class="panel-label">Tipe Kiper (GK)</label>
             <select id="gkSelect" onchange="updateConfig()" style="width:100%; padding:5px; background:#333; color:white; border:1px solid #555; border-radius:4px;">
-                <option value="1" selected>GK 1: Gerak Sinusoidal</option>
+                <option value="1">GK 1: Gerak Sinusoidal</option>
                 <option value="2">GK 2: Bisektor (Optimal)</option>
-                <option value="3">GK 3: Refleks (Radius+)</option>
+                <option value="3" selected>GK 3: Refleks (Radius+)</option>
             </select>
         </div>
 
@@ -187,8 +187,8 @@
     let coverageStats = { covered: 0, open: 3.0, x1: 0, x2: 0 };
     
     // Konfigurasi
-    let stType = 2;
-    let gkType = 1; 
+    let stType = 3;
+    let gkType = 3; 
     let ballSpeed = 26;
     let gkReflexTime = 200;
     let showHeatmap = false;
@@ -196,36 +196,43 @@
     let shotTime = 0; // Waktu saat bola ditendang
     let lastUIUpdate = 0; // Variabel untuk throttling UI
 
+    // Variabel untuk Heatmap Gradasi
+    let heatmapCanvas = null;
+    let heatmapCtx = null;
+    let isHeatmapDirty = true; // Flag untuk regenerasi heatmap
+
     function tx(meters) { return ORIGIN_X + (meters * SCALE); }
     function ty(meters) { return ORIGIN_Y - (meters * SCALE); }
 
     // --- FUNGSI UTAMA: CALCULATE xG ---
     // Sekarang menerima parameter 'test_x' dan 'test_y' (opsional). 
     // Jika kosong, pakai posisi striker asli.
-    // Menggunakan logika Angle-Based agar konsisten dengan Tabel Data
+    // Menggunakan pendekatan Probabilitas Intersepsi (Sigmoid)
     function calculateXG(test_x = null, test_y = null) {
         const x = (test_x !== null) ? test_x : st.x_curr;
         const y = (test_y !== null) ? test_y : st.y_pos;
+
+        // Jika striker sudah melewati kiper secara vertikal (y < gk.y_pos), peluang gol sangat tinggi (Empty Net)
+        if (y < gk.y_pos) return 0.99;
         
-        // 1. Hitung Posisi Optimal Kiper (Bisektor) untuk perhitungan xG ideal
+        // Jika bola ditembak persis di titik kiper berdiri (jarak sangat dekat), kiper pasti langsung menangkapnya
+        if (y >= gk.y_pos && y <= gk.y_pos + 0.2) return 0.0;
+
+        // --- FAKTOR 1: SUDUT BUKAAN (GEOMETRI) ---
+        // 1. Hitung sudut total ke gawang
         let angleLeft = Math.atan2(0 - y, -1.5 - x);
         let angleRight = Math.atan2(0 - y, 1.5 - x);
+        let goalAngle = Math.abs(angleLeft - angleRight);
+
+        // 2. Hitung cakupan (coverage) dari kiper di posisi optimal (Bisektor)
         let bisector = (angleLeft + angleRight) / 2;
+        let dy_gk = gk.y_pos - y;
+        let gkOptX = x + (dy_gk / Math.tan(bisector));
         
-        let dy = gk.y_pos - y;
-        let gkX = x + (dy / Math.tan(bisector));
-        
-        // Jika striker sudah melewati kiper (y < gk.y_pos), peluang gol sangat tinggi
-        if (y <= gk.y_pos + 0.2) return 0.99;
-
-        // 2. Hitung Coverage
-        let distStToGoal = y;
-        let distStToGk = y - gk.y_pos;
-        if (distStToGk < 0.1) distStToGk = 0.1;
-
-        let scale = distStToGoal / distStToGk;
-        let projX = x + (gkX - x) * scale;
-        let projR = gk.radius_block * scale;
+        let distStToGk = Math.max(0.1, y - gk.y_pos);
+        let scale = y / distStToGk;
+        let projX = x + (gkOptX - x) * scale;
+        let projR = 0.40 * scale; // Gunakan radius standar (0.40) untuk perhitungan geometris
         
         let blockLeft = projX - projR;
         let blockRight = projX + projR;
@@ -236,25 +243,57 @@
         let covered = Math.max(0, x2 - x1);
         let open = 3.0 - covered;
 
-        // 3. Hitung xG Berbasis Sudut (Angle Based)
-        let goalAngle = Math.abs(angleLeft - angleRight);
-        let openAngle = goalAngle * (open / 3.0);
-        
-        let xgVal = openAngle * 2.5; 
-        
-        // --- FAKTOR KECEPATAN BOLA ---
-        // Semakin cepat bola, semakin sulit kiper bereaksi -> xG naik
-        // Baseline: 26 m/s (Default) -> Factor 1.0. Tiap 1 m/s beda 2%.
-        let speedFactor = 1.0 + (ballSpeed - 26) * 0.02;
-        xgVal *= speedFactor;
+        // --- FAKTOR 1: GEOMETRI (Bayes-Base) ---
+        // Rasio antara sudut tembak terbuka (theta_open) dan sudut total gawang (theta_goal)
+        let openAngleRad = goalAngle * (open / 3.0);
+        const angleFactor = (goalAngle > 0) ? (openAngleRad / goalAngle) : 0.0;
 
-        // --- FAKTOR REFLEKS KIPER ---
-        // Semakin lambat refleks (waktu besar), semakin mudah gol -> xG naik
-        // Baseline: 200 ms (Default) -> Factor 1.0. Tiap 10 ms beda 1%.
-        let reflexFactor = 1.0 + (gkReflexTime - 200) * 0.001;
-        xgVal *= reflexFactor;
+        // --- FAKTOR 2: WAKTU (KINEMATIKA) ---
+        // 4. Tentukan target tembakan (Asumsi striker mengincar celah terlebar dari posisi optimal kiper)
+        let distLeft = Math.abs(gkOptX - (-1.3));
+        let distRight = Math.abs(gkOptX - 1.3);
+        let targetX = (distLeft > distRight) ? -1.3 : 1.3;
 
+        // 5. Titik potong (intercept) lintasan bola pada garis kiper
+        let yRatio = (y - gk.y_pos) / y;
+        let interceptX = x + (targetX - x) * yRatio;
+
+        // 6. Hitung tau_exp (waktu bola tiba)
+        let dBallX = interceptX - x;
+        let dBallY = gk.y_pos - y;
+        let dBall = Math.sqrt(dBallX * dBallX + dBallY * dBallY);
+        let gkReach = (gkType === 3) ? 0.6 : gk.radius_block; // Jangkauan kiper
+        let effectiveBallDist = Math.max(0, dBall - gkReach);   
+        let tau_exp = effectiveBallDist / ballSpeed;
+
+        // 7. Hitung tau_true (waktu kiper tiba) dengan GLBB
+        let reflexSec = gkReflexTime / 1000.0;
+        let dGk = Math.max(0, Math.abs(gkOptX - interceptX) - gkReach);
+        
+        // Kinematika GLBB: d = 1/2 * a * t^2  =>  t = sqrt(2d / a)
+        const GK_ACCEL = 8.0; // Percepatan akselerasi kiper (m/s^2)
+        let t_move = Math.sqrt((2 * dGk) / GK_ACCEL);
+        let tau_true = reflexSec + t_move;
+
+        // 8. Probabilitas Intercept dan Faktor Waktu (Spearman-Logic)
+        const lambda = 15.0; // Konstanta kecuraman kurva (bisa di-tune)
+        // Catatan: Menggunakan (tau_exp - tau_true) agar selaras dengan simulasi fisika
+        let p_intercept = 1.0 / (1.0 + Math.exp(-lambda * (tau_exp - tau_true)));
+        const timeFactor = 1.0 - p_intercept;
+
+        // --- FAKTOR 3: KOREKSI BAYES ---
+        let gamma_player = 1.0; 
+        if (stType === 1) gamma_player = 0.85;      // ST 1: Tiang Dekat (Kurang Optimal)
+        else if (stType === 2) gamma_player = 0.95; // ST 2: Tiang Jauh (Cukup Optimal)
+        else if (stType === 3) gamma_player = 1.0;  // ST 3: Celah Terlebar (Sangat Optimal)
+
+        // --- FINAL xG ---
+        // 9. Gabungkan ketiga faktor sesuai rumus
+        let xgVal = angleFactor * timeFactor * gamma_player;
+
+        // Batasi nilai xG agar logis
         if (xgVal > 0.99) xgVal = 0.99;
+        if (xgVal < 0.0) xgVal = 0.0;
         
         return xgVal;
     }
@@ -262,6 +301,7 @@
     function updateConfig() {
         stType = parseInt(document.getElementById('stSelect').value);
         gkType = parseInt(document.getElementById('gkSelect').value);
+        isHeatmapDirty = true; // Regenerate heatmap on config change
     }
 
     function toggleStMove() {
@@ -285,10 +325,12 @@
         gkReflexTime = parseInt(document.getElementById('reflexTimeInput').value);
         document.getElementById('ballSpeedVal').innerText = ballSpeed;
         document.getElementById('reflexTimeVal').innerText = gkReflexTime;
+        isHeatmapDirty = true; // Regenerate heatmap on physics change
     }
 
     function toggleHeatmap() {
         showHeatmap = document.getElementById('heatmapToggle').checked;
+        // No need to set dirty flag here, generateHeatmap is called in draw loop
     }
 
     function updateCoverage() {
@@ -486,9 +528,9 @@
         let distRight = Math.abs(simGkX - 1.3);
         let targetX = (distLeft > distRight) ? -1.3 : 1.3;
         
-        // --- NOISE AKURASI (Agar data tidak biner 0/100) ---
+        // --- NOISE AKURASI (Linear) ---
+        // Error acak +/- 0.3 meter pada target tembakan di garis gawang
         if (useNoise) {
-            // Error acak +/- 0.3 meter pada target tembakan
             targetX += (Math.random() - 0.5) * 0.6;
         }
         
@@ -496,6 +538,7 @@
         let dx = targetX - simBallX;
         let dyBall = 0 - simBallY;
         let d = Math.sqrt(dx*dx + dyBall*dyBall);
+        
         let vx = (dx/d) * speed;
         let vy = (dyBall/d) * speed;
         
@@ -513,7 +556,15 @@
             let timeSinceShotMs = simT * 1000;
             if (timeSinceShotMs > reflexTime) {
                 let interceptX = simBallX + (gk.y_pos - simBallY) * (vx / vy);
-                simGkX += (interceptX - simGkX) * 0.08;
+                let diff = interceptX - simGkX;
+                
+                // Reaksi Fisika GLBB: v = a * t
+                let timeMoving = simT - (reflexTime / 1000.0);
+                let currentSpeed = 8.0 * timeMoving; // GK_ACCEL = 8.0 m/s^2
+                let moveStep = currentSpeed * dtSim;
+                
+                if (Math.abs(diff) <= moveStep) simGkX = interceptX;
+                else simGkX += Math.sign(diff) * moveStep;
             } else {
                 // Tracking (Idle)
                 let aL = Math.atan2(0 - stY, -1.5 - stX);
@@ -521,7 +572,10 @@
                 let bS = (aL + aR) / 2;
                 let dY = gk.y_pos - stY;
                 let tX = stX + (dY / Math.tan(bS));
-                simGkX += (tX - simGkX) * 0.1;
+                let diff = tX - simGkX;
+                let moveStep = 4.0 * dtSim;
+                if (Math.abs(diff) <= moveStep) simGkX = tX;
+                else simGkX += Math.sign(diff) * moveStep;
             }
             
             // GK 3: Refleks Membesar (Simulasi)
@@ -531,10 +585,9 @@
             }
             
             // Cek Tabrakan (Block)
-            if (simBallY <= gk.y_pos && simBallY >= gk.y_pos - 0.5) {
-                if (Math.abs(simBallX - simGkX) <= gk.radius_block) return false; // Blocked
-                if (Math.abs(simBallX - simGkX) <= simRadius) return false; // Blocked
-            }
+            // Menggunakan pengecekan jarak 2D (lingkaran) agar lebih akurat
+            const distBallToGk = Math.sqrt((simBallX - simGkX)**2 + (simBallY - gk.y_pos)**2);
+            if (distBallToGk <= simRadius) return false; // Blocked
             
             // Cek Gawang (Goal/Miss)
             if (simBallY <= 0) {
@@ -546,6 +599,60 @@
         return false;
     }
 
+    // --- FUNGSI BARU: GENERATE HEATMAP GRADASI ---
+    function generateHeatmap() {
+        if (!isHeatmapDirty) return; // Optimasi: Jangan kalkulasi ulang jika tidak ada perubahan
+
+        console.log("Generating smooth xG heatmap...");
+        const imageData = heatmapCtx.createImageData(canvas.width, canvas.height);
+        const data = imageData.data;
+
+        // Definisikan warna gradasi
+        const red = [220, 38, 38];     // Merah yang lebih lembut (soft crimson)
+        const yellow = [250, 204, 21]; // Kuning yang lebih hangat
+        const green = [34, 197, 94];   // Hijau yang lebih natural
+
+        for (let i = 0; i < data.length; i += 4) {
+            const px = (i / 4) % canvas.width;
+            const py = Math.floor((i / 4) / canvas.width);
+
+            // Konversi koordinat pixel ke meter di lapangan
+            const fieldX = (px - ORIGIN_X) / SCALE;
+            const fieldY = (ORIGIN_Y - py) / SCALE;
+
+            // Hanya kalkulasi untuk area di dalam lapangan
+            if (fieldX >= -10 && fieldX <= 10 && fieldY >= 1 && fieldY <= 20) {
+                const xg = calculateXG(fieldX, fieldY);
+                
+                let r, g, b;
+
+                // Interpolasi warna
+                if (xg < 0.4) { // Gradasi Merah -> Kuning
+                    const t = xg / 0.4;
+                    r = red[0] + t * (yellow[0] - red[0]);
+                    g = red[1] + t * (yellow[1] - red[1]);
+                    b = red[2] + t * (yellow[2] - red[2]);
+                } else if (xg < 0.7) { // Gradasi Kuning -> Hijau
+                    const t = (xg - 0.4) / 0.3;
+                    r = yellow[0] + t * (green[0] - yellow[0]);
+                    g = yellow[1] + t * (green[1] - yellow[1]);
+                    b = yellow[2] + t * (green[2] - yellow[2]);
+                } else { // Hijau solid
+                    r = green[0]; g = green[1]; b = green[2];
+                }
+
+                data[i] = r;
+                data[i + 1] = g;
+                data[i + 2] = b;
+                data[i + 3] = 160; // Alpha (transparansi), dinaikkan menjadi ~63% agar lebih pekat
+            }
+        }
+
+        heatmapCtx.putImageData(imageData, 0, 0);
+        isHeatmapDirty = false; // Tandai sudah bersih, tidak perlu digenerate lagi
+        console.log("Heatmap generation complete.");
+    }
+
     // --- VISUALISASI ---
     function drawField() {
         ctx.clearRect(0,0,canvas.width,canvas.height);
@@ -554,22 +661,10 @@
         ctx.fillStyle = "#1a2e1a"; 
         ctx.fillRect(tx(-10), ty(0), 20*SCALE, -20*SCALE);
 
-        // --- HEATMAP xG ---
+        // --- HEATMAP xG (GRADASI) ---
         if (showHeatmap) {
-            for (let x = -10; x < 10; x++) {
-                for (let y = 0; y < 20; y++) {
-                    // Hitung xG di tengah grid (x+0.5, y+0.5)
-                    let val = calculateXG(x + 0.5, y + 0.5);
-                    
-                    // Tentukan Warna (Transparan)
-                    if (val > 0.7) ctx.fillStyle = "rgba(0, 200, 83, 0.35)"; // Hijau
-                    else if (val > 0.4) ctx.fillStyle = "rgba(255, 214, 0, 0.35)"; // Kuning
-                    else ctx.fillStyle = "rgba(213, 0, 0, 0.35)"; // Merah
-                    
-                    // Gambar Kotak Grid
-                    ctx.fillRect(tx(x), ty(y+1), SCALE, SCALE);
-                }
-            }
+            generateHeatmap(); // Fungsi ini hanya akan berjalan jika ada perubahan (isHeatmapDirty)
+            ctx.drawImage(heatmapCanvas, 0, 0);
         }
 
         // Grid 1x1 Meter
@@ -674,8 +769,11 @@
                 let dy = gk.y_pos - st.y_pos;
                 let targetX = st.x_curr + (dy / Math.tan(bisector));
                 
-                // Smoothing gerak
-                gk.x_curr += (targetX - gk.x_curr) * 0.1;
+                // Menggunakan kecepatan konstan 4.0 m/s agar sesuai dengan perhitungan xG
+                let diff = targetX - gk.x_curr;
+                let moveStep = 4.0 * dt;
+                if (Math.abs(diff) <= moveStep) gk.x_curr = targetX;
+                else gk.x_curr += Math.sign(diff) * moveStep;
             }
         } else {
             if (gkType === 1) {
@@ -690,7 +788,15 @@
                 if (timeSinceShot > gkReflexTime) {
                     // GK 2 & 3: Reaksi ke bola (Mencoba blok)
                     let interceptX = ball.x + (gk.y_pos - ball.y) * (ball.vx / ball.vy);
-                    gk.x_curr += (interceptX - gk.x_curr) * 0.08;
+                    let diff = interceptX - gk.x_curr;
+                
+                // Reaksi Fisika GLBB: v = a * t
+                let timeMoving = (t - shotTime) - (gkReflexTime / 1000.0);
+                let currentSpeed = 8.0 * timeMoving; // GK_ACCEL = 8.0 m/s^2
+                let moveStep = currentSpeed * dt;
+                
+                    if (Math.abs(diff) <= moveStep) gk.x_curr = interceptX;
+                    else gk.x_curr += Math.sign(diff) * moveStep;
                 } else {
                     // SELAMA REFLEKS (Belum sadar): Tetap tracking striker (Idle)
                     // Agar tidak freeze saat bola melaju
@@ -699,7 +805,10 @@
                     let bisector = (angleLeft + angleRight) / 2;
                     let dy = gk.y_pos - st.y_pos;
                     let targetX = st.x_curr + (dy / Math.tan(bisector));
-                    gk.x_curr += (targetX - gk.x_curr) * 0.1;
+                    let diff = targetX - gk.x_curr;
+                    let moveStep = 4.0 * dt;
+                    if (Math.abs(diff) <= moveStep) gk.x_curr = targetX;
+                    else gk.x_curr += Math.sign(diff) * moveStep;
                 }
                 
                 // GK 3: Refleks Membesar
@@ -715,15 +824,17 @@
         // Fisika Bola
         if(ball.active){
             ball.x+=ball.vx*dt; ball.y+=ball.vy*dt;
-            // Cek Tabrakan
-            if(ball.y<=gk.y_pos && ball.y>=gk.y_pos-0.5 && Math.abs(ball.x-gk.x_curr)<=gk.radius_block){
+            // Cek Tabrakan (Block) - Menggunakan Pengecekan Jarak 2D (Lingkaran)
+            // Ini lebih akurat daripada cek pada satu garis y saja, terutama untuk tembakan sudut tajam.
+            const distBallToGk = Math.sqrt((ball.x - gk.x_curr)**2 + (ball.y - gk.y_pos)**2);
+            if (distBallToGk <= gk.radius_block) { // radius_block adalah jangkauan kiper
                 ball.active=false; 
                 document.getElementById('shootBtn').disabled=false;
                 gk.diveTimer = 30; // Efek visual selama 30 frame (0.5 detik)
-                showMatchResult("BLOCKED!", "#ff1744"); // Merah Terang
+                showMatchResult("GAGAL", "#ff9800"); // Oranye untuk semua non-goal
             }
-            // Cek Gawang
-            if(ball.y<=0){ 
+            // Cek Gawang (Gunakan else if agar tidak bentrok dengan blok di frame yang sama)
+            else if(ball.y<=0){ 
                 // Koreksi posisi bola tepat di garis gawang (y=0)
                 // Mengatasi overshoot karena simulasi per frame
                 let exactX = ball.x - (ball.y / ball.vy) * ball.vx;
@@ -738,6 +849,7 @@
                     showMatchResult("GOAL!!!", "#00e676"); 
                 } else {
                     console.log("Result: MISSED");
+                    showMatchResult("GAGAL", "#ff9800"); // Oranye untuk semua non-goal
                 }
             }
         }
@@ -763,16 +875,16 @@
             targetX = (distLeft > distRight) ? -1.3 : 1.3;
         }
         
-        // --- TAMBAHAN: HUMAN ERROR (NOISE) ---
-        // Menambahkan variasi acak +/- 0.3 meter agar visualisasi tidak kaku (deterministik)
-        // Ini menyamakan logika visual dengan logika pengambilan data CSV
+        // --- TAMBAHAN: HUMAN ERROR (NOISE LINEAR) ---
+        // Menambahkan variasi acak +/- 0.3 meter agar visualisasi tidak kaku
         targetX += (Math.random() - 0.5) * 0.6;
         
         let dx = targetX - ball.x;
         let dy = 0 - ball.y;
-        let d=Math.sqrt(dx*dx+dy*dy), s=ballSpeed; 
+        let d = Math.sqrt(dx*dx + dy*dy), s = ballSpeed; 
         
-        ball.vx=(dx/d)*s; ball.vy=(dy/d)*s;
+        ball.vx = (dx/d) * s;
+        ball.vy = (dy/d) * s;
         document.getElementById('shootBtn').disabled=true; 
 
         // --- LOG DETAIL xG SAAT MENEMBAK ---
@@ -852,7 +964,17 @@
 
     // --- INTERAKSI KEYBOARD ---
     // Inisialisasi Config Awal
-    updateConfig();
+    function initialize() {
+        // Inisialisasi canvas off-screen untuk heatmap
+        heatmapCanvas = document.createElement('canvas');
+        heatmapCanvas.width = canvas.width;
+        heatmapCanvas.height = canvas.height;
+        // willReadFrequently penting untuk performa putImageData
+        heatmapCtx = heatmapCanvas.getContext('2d', { willReadFrequently: true }); 
+        
+        updateConfig();
+        updatePhysics();
+    }
     
     document.addEventListener('keydown', (e) => {
         if (e.code === "Space") {
@@ -861,6 +983,7 @@
         }
     });
 
+    initialize(); // Panggil inisialisasi sebelum loop utama
     function loop() { update(); drawField(); drawAgents(); drawMatchResult(); requestAnimationFrame(loop); }
     loop();
 </script>
